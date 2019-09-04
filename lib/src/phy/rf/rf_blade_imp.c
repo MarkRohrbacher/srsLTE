@@ -22,6 +22,7 @@
 #include <libbladeRF.h>
 #include <string.h>
 #include <unistd.h>
+#include <pthread.h>
 
 #include "srslte/srslte.h"
 #include "rf_blade_imp.h"
@@ -30,6 +31,7 @@
 #define CONVERT_BUFFER_SIZE (240*1024)
 
 typedef struct {
+  pthread_mutex_t mutex;
   struct bladerf *dev; 
   bladerf_sample_rate rx_rate;
   bladerf_sample_rate tx_rate;
@@ -53,7 +55,11 @@ void rf_blade_register_error_handler(void *notused, srslte_rf_error_handler_t ne
 
 bool rf_blade_rx_wait_lo_locked(void *h)
 {
+  rf_blade_handler_t *handler = (rf_blade_handler_t*) h;
+  // TODO: check if mutex is required here, too
+  // pthread_mutex_lock(&handler->mutex);
   usleep(1000);
+  // pthread_mutex_unlock(&handler->mutex);
   return true; 
 }
 
@@ -74,6 +80,7 @@ int rf_blade_start_tx_stream(void *h)
   int status; 
   rf_blade_handler_t *handler = (rf_blade_handler_t*) h;
   
+  pthread_mutex_lock(&handler->mutex);
   status = bladerf_sync_config(handler->dev,
                                 BLADERF_TX_X1,
                                 BLADERF_FORMAT_SC16_Q11_META,
@@ -83,21 +90,24 @@ int rf_blade_start_tx_stream(void *h)
                                 timeout_ms);
   if (status != 0) {
     ERROR("Failed to configure TX sync interface: %s\n", bladerf_strerror(status));
-    return status; 
+    goto exit;
   }
   status = bladerf_enable_module(handler->dev, BLADERF_MODULE_TX, true);
   if (status != 0) {
     ERROR("Failed to enable TX module: %s\n", bladerf_strerror(status));
-    return status;
+    goto exit;
   }
-  handler->tx_stream_enabled = true; 
-  return 0;
+  handler->tx_stream_enabled = true;
+exit:
+  pthread_mutex_unlock(&handler->mutex);
+  return status;
 }
 
 int rf_blade_start_rx_stream(void *h, bool now)
 {
   int status; 
   rf_blade_handler_t *handler = (rf_blade_handler_t*) h;
+  pthread_mutex_lock(&handler->mutex);
     
   /* Configure the device's RX module for use with the sync interface.
      * SC16 Q11 samples *with* metadata are used. */
@@ -112,7 +122,7 @@ int rf_blade_start_rx_stream(void *h, bool now)
                                 timeout_ms);
   if (status != 0) {
     ERROR("Failed to configure RX sync interface: %s\n", bladerf_strerror(status));
-    return status;
+    goto exit;
   }
   status = bladerf_sync_config(handler->dev,
                                 BLADERF_TX_X1,
@@ -123,38 +133,44 @@ int rf_blade_start_rx_stream(void *h, bool now)
                                 timeout_ms);
   if (status != 0) {
     ERROR("Failed to configure TX sync interface: %s\n", bladerf_strerror(status));
-    return status; 
+    goto exit;
   }
   status = bladerf_enable_module(handler->dev, BLADERF_MODULE_RX, true);
   if (status != 0) {
     ERROR("Failed to enable RX module: %s\n", bladerf_strerror(status));
-    return status;
+    goto exit;
   }
   status = bladerf_enable_module(handler->dev, BLADERF_MODULE_TX, true);
   if (status != 0) {
     ERROR("Failed to enable TX module: %s\n", bladerf_strerror(status));
-    return status;
+    goto exit;
   }
   handler->rx_stream_enabled = true; 
-  return 0;
+exit:
+  pthread_mutex_unlock(&handler->mutex);
+  return status;
 }
 
 int rf_blade_stop_rx_stream(void *h)
 {
+  int status;
   rf_blade_handler_t *handler = (rf_blade_handler_t*) h;
-  int status = bladerf_enable_module(handler->dev, BLADERF_MODULE_RX, false);
+  pthread_mutex_lock(&handler->mutex);
+  status = bladerf_enable_module(handler->dev, BLADERF_MODULE_RX, false);
   if (status != 0) {
     ERROR("Failed to enable RX module: %s\n", bladerf_strerror(status));
-    return status;
+    goto exit;
   }
   status = bladerf_enable_module(handler->dev, BLADERF_MODULE_TX, false);
   if (status != 0) {
     ERROR("Failed to enable TX module: %s\n", bladerf_strerror(status));
-    return status;
+    goto exit;
   }
   handler->rx_stream_enabled = false;
   handler->tx_stream_enabled = false; 
-  return 0;
+exit:
+  pthread_mutex_unlock(&handler->mutex);
+  return status;
 }
 
 void rf_blade_flush_buffer(void *h)
@@ -187,6 +203,7 @@ int rf_blade_open(char *args, void **h)
     perror("malloc");
     return -1; 
   }
+  handler->mutex = PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP;
   *h = handler; 
 
   printf("Opening bladeRF...\n");
@@ -257,69 +274,97 @@ bool rf_blade_is_master_clock_dynamic(void *h)
 
 double rf_blade_set_rx_srate(void *h, double freq)
 {
+  int status;
   uint32_t bw;
+  double rate;
   rf_blade_handler_t *handler = (rf_blade_handler_t*) h;
-  int status = bladerf_set_sample_rate(handler->dev, BLADERF_MODULE_RX, (uint32_t) freq, &handler->rx_rate);
+  pthread_mutex_lock(&handler->mutex);
+  status = bladerf_set_sample_rate(handler->dev, BLADERF_MODULE_RX, (uint32_t) freq, &handler->rx_rate);
   if (status != 0) {
     ERROR("Failed to set samplerate = %u: %s\n", (uint32_t)freq, bladerf_strerror(status));
-    return -1;
+    goto error;
   }
   if (handler->rx_rate < 2000000) { 
     status = bladerf_set_bandwidth(handler->dev, BLADERF_MODULE_RX, handler->rx_rate, &bw);
     if (status != 0) {
       ERROR("Failed to set bandwidth = %u: %s\n", handler->rx_rate, bladerf_strerror(status));
-      return -1;
+      goto error;
     }
   } else {
     status = bladerf_set_bandwidth(handler->dev, BLADERF_MODULE_RX, (bladerf_bandwidth) (handler->rx_rate * 0.8), &bw);
     if (status != 0) {
       ERROR("Failed to set bandwidth = %u: %s\n", handler->rx_rate, bladerf_strerror(status));
-      return -1;
+      goto error;
     }
   }
   printf("Set RX sampling rate %.2f Mhz, filter BW: %.2f Mhz\n", (float) handler->rx_rate/1e6, (float) bw/1e6);
-  return (double) handler->rx_rate;
+  rate = (double) handler->rx_rate;
+  pthread_mutex_unlock(&handler->mutex);
+  return rate;
+error:
+  pthread_mutex_unlock(&handler->mutex);
+  return -1;
 }
 
 double rf_blade_set_tx_srate(void *h, double freq)
 {
+  int status;
   uint32_t bw;
+  double rate;
   rf_blade_handler_t *handler = (rf_blade_handler_t*) h;
-  int status = bladerf_set_sample_rate(handler->dev, BLADERF_MODULE_TX, (uint32_t) freq, &handler->tx_rate);
+  pthread_mutex_lock(&handler->mutex);
+  status = bladerf_set_sample_rate(handler->dev, BLADERF_MODULE_TX, (uint32_t) freq, &handler->tx_rate);
   if (status != 0) {
     ERROR("Failed to set samplerate = %u: %s\n", (uint32_t)freq, bladerf_strerror(status));
-    return -1;
+    goto error;
   }  
   status = bladerf_set_bandwidth(handler->dev, BLADERF_MODULE_TX, handler->tx_rate, &bw);
   if (status != 0) {
     ERROR("Failed to set bandwidth = %u: %s\n", handler->tx_rate, bladerf_strerror(status));
-    return -1;
+    goto error;
   }
-  return (double) handler->tx_rate;
+  rate = (double) handler->tx_rate;
+  pthread_mutex_unlock(&handler->mutex);
+  return rate;
+error:
+  pthread_mutex_unlock(&handler->mutex);
+  return -1;
 }
 
 double rf_blade_set_rx_gain(void *h, double gain)
 {
   int status; 
   rf_blade_handler_t *handler = (rf_blade_handler_t*) h;
+  pthread_mutex_lock(&handler->mutex);
   status = bladerf_set_gain(handler->dev, BLADERF_MODULE_RX, (bladerf_gain) gain);
   if (status != 0) {
     ERROR("Failed to set RX gain: %s\n", bladerf_strerror(status));
-    return -1;
+    goto error;
   }
-  return rf_blade_get_rx_gain(h);
+  double rx_gain = rf_blade_get_rx_gain(h);
+  pthread_mutex_unlock(&handler->mutex);
+  return rx_gain;
+error:
+  pthread_mutex_unlock(&handler->mutex);
+  return -1;
 }
 
 double rf_blade_set_tx_gain(void *h, double gain)
 {
   int status; 
   rf_blade_handler_t *handler = (rf_blade_handler_t*) h;
+  pthread_mutex_lock(&handler->mutex);
   status = bladerf_set_gain(handler->dev, BLADERF_MODULE_TX, (bladerf_gain) gain);
   if (status != 0) {
     ERROR("Failed to set TX gain: %s\n", bladerf_strerror(status));
-    return -1;
+    goto error;
   }
-  return rf_blade_get_tx_gain(h);
+  double tx_gain = rf_blade_get_tx_gain(h);
+  pthread_mutex_unlock(&handler->mutex);
+  return tx_gain;
+error:
+  pthread_mutex_unlock(&handler->mutex);
+  return -1;
 }
 
 double rf_blade_get_rx_gain(void *h)
@@ -327,12 +372,17 @@ double rf_blade_get_rx_gain(void *h)
   int status;
   bladerf_gain gain = 0;
   rf_blade_handler_t *handler = (rf_blade_handler_t*) h;
+  pthread_mutex_lock(&handler->mutex);
   status = bladerf_get_gain(handler->dev, BLADERF_MODULE_RX, &gain);
   if (status != 0) {
     ERROR("Failed to get RX gain: %s\n", bladerf_strerror(status));
-    return -1;
+    goto error;
   }
+  pthread_mutex_unlock(&handler->mutex);
   return gain;
+error:
+  thread_mutex_unlock(&handler->mutex);
+  return -1;
 }
 
 double rf_blade_get_tx_gain(void *h)
@@ -340,12 +390,17 @@ double rf_blade_get_tx_gain(void *h)
   int status;
   bladerf_gain gain = 0;
   rf_blade_handler_t *handler = (rf_blade_handler_t*) h;
+  pthread_mutex_lock(&handler->mutex);
   status = bladerf_get_gain(handler->dev, BLADERF_MODULE_TX, &gain);
   if (status != 0) {
     ERROR("Failed to get TX gain: %s\n", bladerf_strerror(status));
-    return -1;
+    goto error;
   }
+  pthread_mutex_unlock(&handler->mutex);
   return gain;
+error:
+  thread_mutex_unlock(&handler->mutex);
+  return -1;
 }
 
 srslte_rf_info_t *rf_blade_get_info(void *h)
@@ -354,9 +409,11 @@ srslte_rf_info_t *rf_blade_get_info(void *h)
   srslte_rf_info_t *info = NULL;
 
   if (h) {
-    rf_blade_handler_t *handler = (rf_blade_handler_t*) h;
 
+    rf_blade_handler_t *handler = (rf_blade_handler_t*) h;
+    pthread_mutex_lock(&handler->mutex);
     info = &handler->info;
+    pthread_mutex_unlock(&handler->mutex);
   }
   return info;
 }
@@ -365,32 +422,42 @@ double rf_blade_set_rx_freq(void* h, uint32_t ch, double freq)
 {
   rf_blade_handler_t* handler = (rf_blade_handler_t*)h;
   bladerf_frequency f_int = (uint32_t) round(freq);
+  pthread_mutex_lock(&handler->mutex);
   int status = bladerf_set_frequency(handler->dev, BLADERF_MODULE_RX, f_int);
   if (status != 0) {
     ERROR("Failed to set samplerate = %u: %s\n", (uint32_t)freq, bladerf_strerror(status));
-    return -1;
+    goto error;
   }
   f_int=0;
   bladerf_get_frequency(handler->dev, BLADERF_MODULE_RX, &f_int);
   printf("set RX frequency to %lu\n", f_int);
   
+  pthread_mutex_unlock(&handler->mutex);
   return freq;
+error:
+  pthread_mutex_unlock(&handler->mutex);
+  return -1;
 }
 
 double rf_blade_set_tx_freq(void* h, uint32_t ch, double freq)
 {
   rf_blade_handler_t *handler = (rf_blade_handler_t*) h;
   bladerf_frequency   f_int   = (uint32_t)round(freq);
+  pthread_mutex_lock(&handler->mutex);
   int status = bladerf_set_frequency(handler->dev, BLADERF_MODULE_TX, f_int);
   if (status != 0) {
     ERROR("Failed to set samplerate = %u: %s\n", (uint32_t)freq, bladerf_strerror(status));
-    return -1;
+    goto error;
   }
 
   f_int=0;
   bladerf_get_frequency(handler->dev, BLADERF_MODULE_TX, &f_int);
   printf("set TX frequency to %lu\n", f_int);
+  pthread_mutex_unlock(&handler->mutex);
   return freq;
+error:
+  pthread_mutex_unlock(&handler->mutex);
+  return -1;
 }
 
 static void timestamp_to_secs(uint32_t rate, uint64_t timestamp, time_t *secs, double *frac_secs) {
@@ -416,11 +483,13 @@ void rf_blade_get_time(void *h, time_t *secs, double *frac_secs)
   rf_blade_handler_t *handler = (rf_blade_handler_t*) h;
   struct bladerf_metadata meta;
   
+  pthread_mutex_lock(&handler->mutex);
   int status = bladerf_get_timestamp(handler->dev, BLADERF_RX, &meta.timestamp);
   if (status != 0) {
     ERROR("Failed to get current RX timestamp: %s\n", bladerf_strerror(status));
   }
   timestamp_to_secs(handler->rx_rate, meta.timestamp, secs, frac_secs);
+  pthread_mutex_unlock(&handler->mutex);
 }
 
 int rf_blade_recv_with_time_multi(void *h,
@@ -449,12 +518,13 @@ int rf_blade_recv_with_time(void *h,
   
   if (2*nsamples > CONVERT_BUFFER_SIZE) {
     ERROR("RX failed: nsamples exceeds buffer size (%d>%d)\n", nsamples, CONVERT_BUFFER_SIZE);
-    return -1;
+    goto error;
   }
+  pthread_mutex_lock(&handler->mutex);
   status = bladerf_sync_rx(handler->dev, handler->rx_buffer, nsamples, &meta, 2000);
   if (status) {
     ERROR("RX failed: %s\n\n", bladerf_strerror(status));
-    return -1;
+    goto error;
   } else if (meta.status & BLADERF_META_STATUS_OVERRUN) {
     if (blade_error_handler) {
       srslte_rf_error_t error;
@@ -470,7 +540,11 @@ int rf_blade_recv_with_time(void *h,
   timestamp_to_secs(handler->rx_rate, meta.timestamp, secs, frac_secs);
   srslte_vec_convert_if(handler->rx_buffer, 2048, data, 2*nsamples);
   
+  pthread_mutex_unlock(&handler->mutex);
   return nsamples;
+error:
+  pthread_mutex_unlock(&handler->mutex);
+  return -1;
 }
                    
 int rf_blade_send_timed_multi(void *h,
@@ -501,13 +575,15 @@ int rf_blade_send_timed(void *h,
   struct bladerf_metadata meta;
   int status; 
   
+  pthread_mutex_lock(&handler->mutex);
   if (!handler->tx_stream_enabled) {
     rf_blade_start_tx_stream(h);
   }
   
   if (2*nsamples > CONVERT_BUFFER_SIZE) {
     ERROR("TX failed: nsamples exceeds buffer size (%d>%d)\n", nsamples, CONVERT_BUFFER_SIZE);
-    return -1;
+    status = -1;
+    goto error;
   }
 
   srslte_vec_convert_fi(data, 2048, handler->tx_buffer, 2*nsamples);
@@ -537,7 +613,7 @@ int rf_blade_send_timed(void *h,
     }
   } else if (status) {
     ERROR("TX failed: %s\n", bladerf_strerror(status));
-    return status;
+    goto error;
   } else if (meta.status == BLADERF_META_STATUS_UNDERRUN) {
     if (blade_error_handler) {
       error.type = SRSLTE_RF_ERROR_UNDERFLOW;
@@ -546,6 +622,10 @@ int rf_blade_send_timed(void *h,
       ERROR("TX warning: underflow detected.\n");
     }
   }
-  
+
+  pthread_mutex_unlock(&handler->mutex);
   return nsamples;
+error:
+  pthread_mutex_unlock(&handler->mutex);
+  return status;
 }
